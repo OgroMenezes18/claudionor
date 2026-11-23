@@ -27,10 +27,13 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 SKILLS = os.path.join(os.path.dirname(BIN), "skills")
 CACHE = os.path.expanduser("~/.cache/claude-tipado")
+SP = ZoneInfo(os.environ.get("TIPADO_TZ", "America/Sao_Paulo"))   # fuso de exibição
 
 
 # ---------------------------------------------------------------- utilidades ---
@@ -125,6 +128,67 @@ def tabela(colunas: list[str], linhas: list[list], larg: int = 300) -> str:
     return "\n".join(out)
 
 
+def data_curta(s: str | None) -> str:
+    """ISO 8601 -> "29/09/26 11:05". Com offset, mantém a hora local; com Z (UTC), converte para SP."""
+    if not s or len(s) < 16:
+        return s or ""
+    if s.endswith("Z"):
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(SP).strftime("%d/%m/%y %H:%M")
+    return f"{s[8:10]}/{s[5:7]}/{s[2:4]} {s[11:16]}"
+
+
+def html_texto(html: str) -> str:
+    """HTML (inclusive storage do Confluence) -> texto com títulos, listas e tabelas legíveis."""
+    from html.parser import HTMLParser
+
+    class P(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.out, self.pilha = [], []
+
+        def handle_starttag(self, tag, attrs):
+            a = dict(attrs)
+            if tag in ("p", "div", "br", "tr"):
+                self.out.append("\n")
+            elif re.fullmatch(r"h[1-6]", tag):
+                self.out.append("\n" + "#" * int(tag[1]) + " ")
+            elif tag == "li":
+                self.out.append("\n- ")
+            elif tag in ("td", "th"):
+                self.out.append(" | ")
+            elif tag == "ac:structured-macro":
+                self.out.append(f"\n[{a.get('ac:name', 'macro')}] ")
+            elif tag == "ri:page":
+                self.out.append(a.get("ri:content-title", ""))
+            elif tag == "ri:attachment":
+                self.out.append(f"[anexo {a.get('ri:filename', '')}]")
+            elif tag == "a" and a.get("href"):
+                self.pilha.append((a["href"], len(self.out)))
+            if tag == "ac:parameter":
+                self.out.append("(")
+
+        def handle_endtag(self, tag):
+            if tag == "a" and self.pilha:
+                href, ini = self.pilha.pop()
+                if href not in "".join(self.out[ini:]):      # texto do link já é a URL
+                    self.out.append(f" ({href})")
+            elif tag == "ac:parameter":
+                self.out.append(") ")
+            elif re.fullmatch(r"h[1-6]|p|table|ul|ol", tag):
+                self.out.append("\n")
+
+        def handle_data(self, data):
+            self.out.append(data)
+
+        def unknown_decl(self, data):                   # <![CDATA[ ... ]]> de bloco de código
+            self.out.append("\n" + data.removeprefix("CDATA[") + "\n")
+
+    p = P()
+    p.feed(html or "")
+    t = re.sub(r"[ \t]+\n", "\n", "".join(p.out))
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
 def rodape(total: int, mostrados: int, dica: str = "--limite N") -> str:
     cab = f"# {total} linhas"
     if total > mostrados:
@@ -133,6 +197,12 @@ def rodape(total: int, mostrados: int, dica: str = "--limite N") -> str:
 
 
 # ------------------------------------------------------------ como estender ---
+#
+# Comandos de uma conexão moram NA SKILL: skills/<nome>/tipado_cmds.py, com os
+# dicionários COMANDOS e ATALHOS no mesmo formato dos daqui. O arquivo é
+# carregado na partida e enxerga todas as utilidades acima (die, run, opcoes,
+# tabela, data_curta, html_texto…) mais SKILL_DIR, a pasta da própria skill.
+# Assim cada conexão é autocontida: copiou a pasta, ganhou os comandos.
 #
 # Há dois jeitos de registrar um comando.
 #
@@ -149,7 +219,7 @@ def rodape(total: int, mostrados: int, dica: str = "--limite N") -> str:
 #        pos, op = opcoes(argv, {"limite": 20, "full": False})
 #        if len(pos) != 1:
 #            die('uso: exemplo_busca "<termo>" [--limite N] [--full]')
-#        script = skill("exemplo", "exemplo.sh")
+#        script = os.path.join(SKILL_DIR, "exemplo.sh")   # num tipado_cmds.py
 #        if op["full"]:
 #            sys.stdout.write(run([script, "search", pos[0]]))
 #            return
@@ -173,6 +243,35 @@ ATALHOS: dict[str, tuple[str, list[str], dict, str]] = {
 COMANDOS: dict = {
     # "exemplo_busca": cmd_exemplo_busca,
 }
+
+
+# ------------------------------------------------- comandos vindos das skills ---
+
+def carregar_skills() -> None:
+    """Mescla o COMANDOS/ATALHOS de cada skills/*/tipado_cmds.py. Skill com erro avisa e é pulada."""
+    if not os.path.isdir(SKILLS):
+        return
+    base = {k: v for k, v in globals().items()
+            if not k.startswith("__") and k not in ("COMANDOS", "ATALHOS")}
+    for nome in sorted(os.listdir(SKILLS)):
+        arq = os.path.join(SKILLS, nome, "tipado_cmds.py")
+        if not os.path.isfile(arq):
+            continue
+        ns = dict(base, __name__=f"tipado_{nome}", __file__=arq,
+                  SKILL_DIR=os.path.dirname(os.path.realpath(arq)))
+        try:
+            with open(arq) as f:
+                exec(compile(f.read(), arq, "exec"), ns)
+        except Exception as e:  # uma skill quebrada não derruba os outros comandos
+            print(f"aviso: {arq} não carregou ({type(e).__name__}: {e})", file=sys.stderr)
+            continue
+        for k, v in (ns.get("ATALHOS") or {}).items():
+            # caminho do atalho é relativo à própria skill
+            ATALHOS[k] = (os.path.join(nome, v[0]), *v[1:])
+        COMANDOS.update(ns.get("COMANDOS") or {})
+
+
+carregar_skills()
 
 
 # ---------------------------------------------------------------- despacho ---

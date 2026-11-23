@@ -48,7 +48,7 @@ Saída bruta de API é o que mais consome contexto, e ela é relida a cada turno
 O claudionor traz o despachante e as utilidades (`opcoes`, `corta`, `tabela`, `cache_json`, `rodape`…), sem nenhum comando registrado. Para criar um:
 
 1. Copie `.claude/skills/_modelo` para `.claude/skills/<serviço>/` e adapte o script.
-2. Registre no `tipado.py`: em `ATALHOS`, se o script já imprime texto enxuto, ou como função `cmd_<nome>` em `COMANDOS`, se precisa formatar JSON. Há um modelo comentado na seção "como estender" do arquivo.
+2. Crie `.claude/skills/<serviço>/tipado_cmds.py` com os dicionários `ATALHOS` (o script já imprime texto enxuto) e/ou `COMANDOS` (funções `cmd_<nome>` que formatam JSON). O `tipado.py` carrega esse arquivo na partida, com acesso às utilidades do núcleo e a `SKILL_DIR`. Assim cada conexão é autocontida: copiar a pasta da skill basta. Há um modelo comentado na seção "como estender" do `tipado.py`.
 3. `tipado --links` cria os symlinks; `tipado --claude-md <raiz>/CLAUDE.md` atualiza o catálogo entre os marcadores `<!-- tipado:inicio -->` e `<!-- tipado:fim -->`.
 
 A regra no `CLAUDE.md` ("para LER, chame o comando pelo nome") é o que faz o agente preferir o comando enxuto.
