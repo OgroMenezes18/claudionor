@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# ckpt -- checkpoints de trabalho em qualquer repo git, com volta facil.
+#
+# Por que existe: quando o rollback e' feito por um Makefile DENTRO do repo,
+# voltar a um checkpoint antigo restaura o Makefile antigo e apaga a propria
+# saida de emergencia. Este script e' instalado em ~/.local/bin, FORA da
+# arvore versionada, entao sobrevive a qualquer volta.
+#
+# Nenhum comando aqui reescreve historico nem faz push. Toda volta e' um
+# commit novo: da sempre para desfazer o desfazer.
+#
+#   ckpt save [-m "msg"] [-F arquivo]   grava o estado atual
+#   ckpt list [n]                       lista os checkpoints
+#   ckpt status                         o que mudou desde o ultimo
+#   ckpt diff [ref]                     diff contra o ultimo (ou contra ref)
+#   ckpt back                           descarta o nao-gravado
+#   ckpt to <ref>                       volta a um checkpoint (grava a volta)
+#   ckpt undo                           desfaz o ultimo checkpoint
+#
+# Rede de seguranca automatica, separada do historico de decisao:
+#   ckpt auto-on / auto-off             liga/desliga o autosave NESTE repo
+#   ckpt auto                           snapshot do repo do diretorio ATUAL
+#   ckpt auto-all                       snapshot de TODOS os repos vigiados
+#   ckpt auto-list [n]                  lista os snapshots
+#   ckpt auto-diff [ref]                diff do estado atual contra um snapshot
+#   ckpt auto-drop                      apaga a branch autosave (zera a rede)
+# Snapshot vai para a branch `autosave` SEM tocar em HEAD, no index nem na
+# arvore -- entao pode ser tao ruidosa quanto quiser: a `main` so recebe
+# checkpoint deliberado. Para voltar a um snapshot:  ckpt to <hash>
+#
+# Lista de vigiados -- para o hook nao depender do diretorio da sessao:
+#   ckpt watch [dir]                    passa a vigiar o repo (default: atual)
+#   ckpt unwatch [dir]                  para de vigiar
+#   ckpt watched                        mostra a lista e o estado de cada um
+# A lista fica em ~/.config/ckpt/repos (um caminho por linha, # comenta).
+# `auto` depende de onde voce esta; `auto-all` nao -- e' o que o hook Stop
+# chama, porque a sessao raramente roda de dentro do repo que esta sendo
+# editado por caminho absoluto.
+set -euo pipefail
+
+GIT="git -c commit.gpgsign=false"
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+in_repo() { git rev-parse --is-inside-work-tree >/dev/null 2>&1; }
+short() { git rev-parse --short HEAD; }
+
+require_repo() {
+  in_repo || die "aqui nao e' um repo git.
+para comecar a versionar esta pasta:  ckpt init"
+}
+
+cmd_init() {
+  in_repo && die "ja e' um repo git ($(short))"
+  $GIT init -q -b main
+  $GIT add -A
+  $GIT commit -q -m "checkpoint inicial"
+  echo "repo criado, checkpoint inicial: $(short)"
+}
+
+cmd_save() {
+  require_repo
+  local msg="checkpoint" file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m) msg="${2:?-m exige a mensagem}"; shift 2 ;;
+      -F) file="${2:?-F exige o caminho}"; shift 2 ;;
+      *)  msg="$1"; shift ;;
+    esac
+  done
+  $GIT add -A
+  if git diff --cached --quiet; then
+    echo "nada mudou, checkpoint nao criado"
+    return 0
+  fi
+  if [ -n "$file" ]; then $GIT commit -q -F "$file"; else $GIT commit -q -m "$msg"; fi
+  echo "checkpoint gravado: $(short)  ${msg}"
+}
+
+cmd_list() { require_repo; git log --oneline --decorate -"${1:-20}"; }
+
+cmd_status() {
+  require_repo
+  if git diff --quiet && git diff --cached --quiet && \
+     [ -z "$(git ls-files --others --exclude-standard)" ]; then
+    echo "limpo -- igual ao ultimo checkpoint $(short)"
+  else
+    git status --short
+  fi
+}
+
+cmd_diff() { require_repo; git --no-pager diff "${1:-HEAD}"; }
+
+cmd_back() {
+  require_repo
+  git restore --source=HEAD --staged --worktree .
+  echo "voltou ao ultimo checkpoint: $(short)"
+  local novos; novos="$(git ls-files --others --exclude-standard)"
+  [ -n "$novos" ] && { echo "arquivos NOVOS foram mantidos (nao estavam no checkpoint):";
+                       printf '  %s\n' $novos; } || true
+}
+
+cmd_to() {
+  require_repo
+  local ref="${1:?uso: ckpt to <ref>   (pegue o ref em: ckpt list)}"
+  git rev-parse --verify -q "$ref^{commit}" >/dev/null || die "ref desconhecido: $ref"
+  local antes; antes="$(short)"
+  git restore --source="$ref" --staged --worktree .
+  if git diff --cached --quiet; then
+    echo "o estado ja era igual a $ref, nada a gravar"
+    return 0
+  fi
+  $GIT commit -q -m "rollback para $ref"
+  echo "voltou para $ref; gravado como $(short)"
+  echo "para desfazer esta volta:  ckpt to $antes"
+}
+
+cmd_undo() {
+  require_repo
+  git rev-parse --verify -q HEAD~1 >/dev/null || die "so existe um checkpoint, nada a desfazer"
+  cmd_to "$(git rev-parse --short HEAD~1)"
+}
+
+AUTO_REF=refs/heads/autosave
+WATCHLIST="${CKPT_WATCHLIST:-$HOME/.config/ckpt/repos}"
+tmp=""
+trap 'rm -f "${tmp:-}"' EXIT
+
+marker()    { echo "$(git rev-parse --absolute-git-dir)/ckpt-autosave"; }
+marker_of() { echo "$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null)/ckpt-autosave"; }
+root_of()   { git -C "${1:-.}" rev-parse --show-toplevel 2>/dev/null; }
+
+cmd_auto_on() {
+  require_repo
+  : > "$(marker)"
+  echo "autosave LIGADO neste repo (marcador em $(marker))"
+  echo "o marcador vive dentro de .git: nao e' versionado e nao suja a arvore"
+}
+
+cmd_auto_off() {
+  require_repo
+  rm -f "$(marker)"
+  echo "autosave DESLIGADO neste repo (a branch autosave foi mantida)"
+}
+
+# Snapshot sem efeito colateral: index temporario + write-tree + commit-tree,
+# entao HEAD, o index de verdade e a arvore de trabalho ficam intactos. Seguro
+# rodar no meio de qualquer operacao.
+#
+# SEMPRE devolve 0 e usa `return`, nunca `exit`: um repo apagado ou quebrado no
+# meio da lista nao pode abortar o laco do auto-all nem falhar o hook.
+snapshot_repo() {
+  local dir="$1" tree parent ptree commit head
+  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  # -u: so o NOME. O git recusa um index file que exista e esteja vazio, e
+  # mktemp sem -u cria o arquivo -- foi o bug da primeira versao, engolido
+  # pelo `|| return 0`. Por isso o erro vai para a saida em modo CKPT_DEBUG.
+  tmp="$(mktemp -u)"
+  if [ -n "${CKPT_DEBUG:-}" ]; then
+    GIT_INDEX_FILE="$tmp" git -C "$dir" add -A
+    tree="$(GIT_INDEX_FILE="$tmp" git -C "$dir" write-tree)"
+  else
+    GIT_INDEX_FILE="$tmp" git -C "$dir" add -A 2>/dev/null || return 0
+    tree="$(GIT_INDEX_FILE="$tmp" git -C "$dir" write-tree 2>/dev/null)" || return 0
+  fi
+  rm -f "$tmp"; tmp=""
+  parent="$(git -C "$dir" rev-parse -q --verify "$AUTO_REF" || true)"
+  if [ -n "$parent" ]; then
+    ptree="$(git -C "$dir" rev-parse -q --verify "$parent^{tree}" || true)"
+    [ "$tree" = "$ptree" ] && return 0   # nada mudou desde o ultimo snapshot
+  fi
+  head="$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo '?')"
+  commit="$(git -C "$dir" -c commit.gpgsign=false commit-tree "$tree" \
+            ${parent:+-p "$parent"} \
+            -m "autosave $(date '+%Y-%m-%d %H:%M:%S') (main em $head)")" || return 0
+  git -C "$dir" update-ref "$AUTO_REF" "$commit"
+  echo "autosave: $(git -C "$dir" rev-parse --short "$commit")  $dir"
+}
+
+cmd_auto() {
+  in_repo || exit 0                      # fora de repo: silencio, sucesso
+  [ -f "$(marker)" ] || exit 0           # sem opt-in: silencio, sucesso
+  snapshot_repo "$(root_of)"
+}
+
+# Le a lista de vigiados; ignora comentario, linha vazia e espaco em volta.
+read_watchlist() {
+  [ -f "$WATCHLIST" ] || return 0
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -n "$line" ] || continue
+    printf '%s\n' "${line/#\~/$HOME}"
+  done < "$WATCHLIST"
+}
+
+# O que o hook Stop chama: independe do diretorio da sessao.
+cmd_auto_all() {
+  local dir seen=" "
+  # o repo atual entra se tiver o marcador, mesmo fora da lista
+  if in_repo && [ -f "$(marker)" ]; then
+    dir="$(root_of)"; seen="$seen$dir "; snapshot_repo "$dir"
+  fi
+  while IFS= read -r dir; do
+    case "$seen" in *" $dir "*) continue ;; esac
+    seen="$seen$dir "
+    snapshot_repo "$dir"
+  done < <(read_watchlist)
+  exit 0
+}
+
+cmd_watch() {
+  local dir; dir="$(root_of "${1:-.}")"
+  [ -n "$dir" ] || die "nao e' um repo git: ${1:-$PWD}"
+  mkdir -p "$(dirname "$WATCHLIST")"; touch "$WATCHLIST"
+  if grep -qxF "$dir" "$WATCHLIST" 2>/dev/null; then
+    echo "ja estava na lista: $dir"
+  else
+    printf '%s\n' "$dir" >> "$WATCHLIST"
+    echo "vigiado: $dir"
+  fi
+  : > "$(marker_of "$dir")"    # liga o marcador tambem, para o `ckpt auto` local
+  echo "lista: $WATCHLIST"
+}
+
+cmd_unwatch() {
+  local dir; dir="$(root_of "${1:-.}")"
+  [ -n "$dir" ] || dir="${1:-$PWD}"
+  [ -f "$WATCHLIST" ] || die "nao ha lista em $WATCHLIST"
+  grep -vxF "$dir" "$WATCHLIST" > "$WATCHLIST.tmp" 2>/dev/null || true
+  mv "$WATCHLIST.tmp" "$WATCHLIST"
+  echo "fora da lista: $dir  (o marcador local e a branch autosave ficam)"
+}
+
+cmd_watched() {
+  local dir n
+  [ -f "$WATCHLIST" ] || { echo "nenhum repo vigiado (lista: $WATCHLIST)"; return 0; }
+  echo "lista: $WATCHLIST"
+  while IFS= read -r dir; do
+    if ! git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      printf '  %-52s SUMIU ou nao e mais repo\n' "$dir"; continue
+    fi
+    n="$(git -C "$dir" rev-list --count "$AUTO_REF" 2>/dev/null || echo 0)"
+    printf '  %-52s %s snapshots\n' "$dir" "$n"
+  done < <(read_watchlist)
+}
+
+cmd_auto_list() {
+  require_repo
+  git rev-parse -q --verify "$AUTO_REF" >/dev/null || die "nenhum snapshot ainda"
+  git log --oneline -"${1:-20}" "$AUTO_REF"
+}
+
+cmd_auto_diff() {
+  require_repo
+  local ref="${1:-$AUTO_REF}"
+  git --no-pager diff "$ref"
+}
+
+cmd_auto_drop() {
+  require_repo
+  git rev-parse -q --verify "$AUTO_REF" >/dev/null || die "nao ha branch autosave"
+  local n; n="$(git rev-list --count "$AUTO_REF")"
+  git update-ref -d "$AUTO_REF"
+  echo "branch autosave apagada ($n snapshots); a main nao foi tocada"
+}
+
+case "${1:-}" in
+  init)   shift; cmd_init "$@" ;;
+  auto)      shift; cmd_auto "$@" ;;
+  auto-all)  shift; cmd_auto_all "$@" ;;
+  watch)     shift; cmd_watch "$@" ;;
+  unwatch)   shift; cmd_unwatch "$@" ;;
+  watched)   shift; cmd_watched "$@" ;;
+  auto-on)   shift; cmd_auto_on "$@" ;;
+  auto-off)  shift; cmd_auto_off "$@" ;;
+  auto-list) shift; cmd_auto_list "$@" ;;
+  auto-diff) shift; cmd_auto_diff "$@" ;;
+  auto-drop) shift; cmd_auto_drop "$@" ;;
+  save|s) shift; cmd_save "$@" ;;
+  list|l) shift; cmd_list "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  diff)   shift; cmd_diff "$@" ;;
+  back)   shift; cmd_back "$@" ;;
+  to)     shift; cmd_to "$@" ;;
+  undo)   shift; cmd_undo "$@" ;;
+  ''|-h|--help|help) awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0" ;;
+  *) die "subcomando desconhecido: $1   (ckpt --help)" ;;
+esac

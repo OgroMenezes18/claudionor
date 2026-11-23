@@ -1,0 +1,9 @@
+{
+  "model": "opus",
+  "availableModels": ["opus", "sonnet", "haiku"],
+  "enforceAvailableModels": true,
+  "statusLine": {
+    "type": "command",
+    "command": "python3 -I \"@@RAIZ@@/.claude/statusline.py\""
+  }
+}
